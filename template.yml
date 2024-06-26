@@ -1,0 +1,166 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Creates AWS CloudTrail Microsoft Sentinel Integration.
+Parameters:
+    ControlTowerS3BucketName:
+      Description: The Name of the Control Tower logging bucket.
+      Type: String
+    AzureWorkspaceID:
+      Description: Azure Workspace Identifier.
+      Type: String
+    EmailAddress:
+      Description: Email address to send failure notifications in processing the logs.
+      Type: String
+    Suffix:
+      Description: Resource suffix to avoid name conflicts.
+      Default: "cloudtrail"
+      Type: String
+    OIDCProviderArn:
+      Description: Arn for the Sentinel OIDC Provider.
+      Default: ""
+      Type: String
+    KMSKeyArn:
+      Description: Arn for the KMS-CMK used for CloudTrail log encryption.
+      Type: String
+      Default: ""
+Conditions:
+  CreateOIDCProvider: !Equals
+    - !Ref OIDCProviderArn
+    - ""
+  LoggingBucketKMSEncrypted: !Not
+    - !Equals
+      - !Ref KMSKeyArn
+      - ""
+
+Resources:
+  SentinelRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub OIDC_aws-sentinel-oidc-role-${Suffix}
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !If
+                - CreateOIDCProvider
+                - !Ref SentinelOIDC
+                - !Ref OIDCProviderArn
+            Condition:
+              StringLike:
+                sts:RoleSessionName: !Sub "MicrosoftSentinel_${AzureWorkspaceID}"
+      Description: "Sentinel role"
+      Policies:
+
+      - PolicyName: 'S3-policy'
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 's3:GetObject'
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${ControlTowerS3BucketName}/*"
+          - !If
+            - LoggingBucketKMSEncrypted
+            - Effect: Allow
+              Action:
+              - kms:Decrypt
+              Resource:
+                - !Sub ${KMSKeyArn}
+            - !Ref AWS::NoValue
+
+  SentinelOIDC:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOIDCProvider
+    Properties:
+      Url: https://sts.windows.net/33e01921-4d64-4f8c-a055-5bdaffd5e33d/
+      ClientIdList:
+        - api://1462b192-27f7-4cb9-8523-0f4ecb54b47e
+      ThumbprintList:
+        - 626d44e704d1ceabe3bf0d53397464ac8080142c
+
+  SentinelSQS:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: True
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+
+  SentinelSQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - sqs:SendMessage
+              - sqs:GetQueueAttributes
+              - sqs:GetQueueUrl
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:s3:::${ControlTowerS3BucketName}"
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Resource: !GetAtt SentinelSQS.Arn
+          - Action: SQS:SendMessage
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:s3:::${ControlTowerS3BucketName}"
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Resource: !GetAtt SentinelSQS.Arn
+            Sid: SQS-S3-Notifications
+          - Action:
+              - SQS:ChangeMessageVisibility
+              - SQS:DeleteMessage
+              - SQS:ReceiveMessage
+              - SQS:GetQueueUrl
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt SentinelRole.Arn
+            Resource: !GetAtt SentinelSQS.Arn
+            Sid: SQS-Sentinel-Receive
+        Version: '2012-10-17'
+      Queues:
+        - !Ref SentinelSQS
+
+  SentinelSNSAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+      DisplayName: !Sub alert-topic-sentinel-${Suffix}
+      TopicName: !Sub alert-topic-sentinel-${Suffix}
+
+  SentinelAlertTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Sub "${EmailAddress}"
+      Protocol: email
+      TopicArn: !Ref SentinelSNSAlertTopic
+
+  SentinelOldMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sentinel-old-messages-queue-alarm-${Suffix}
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SentinelSQS.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SentinelSNSAlertTopic
+
+Outputs:
+  SentinelRoleArn:
+    Value: !GetAtt SentinelRole.Arn
+  SentinelSQS:
+    Value: !Ref SentinelSQS
