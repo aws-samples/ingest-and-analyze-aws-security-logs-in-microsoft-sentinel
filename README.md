@@ -12,6 +12,25 @@ The code in this repository helps you set up the following target architecture.
 
 For prerequisites and instructions for using this AWS Prescriptive Guidance pattern, see [Ingest and analyze AWS security logs in Microsoft Sentinel](https://docs.aws.amazon.com/prescriptive-guidance/latest/patterns/ingest-analyze-aws-security-logs-sentinel.html).
 
+The same CloudFormation template can be used to send other AWS logs to Microsoft Sentinel following the steps in the AWS Prescriptive Guidance pattern. Logs might require a different Microsoft Sentinel Connector. In particular:
+- The Content Hub Microsoft Sentinel solution **Amazon Web Services S3** has to be used to ingest
+    - **Amazon GuardDuty Findigs**
+    - **AWS VPC Flow Logs**
+    - **AWS CloudTrail Logs**
+    - **AWS CloudWatch Logs**
+-  The Content Hub Microsoft Sentinel solution **Amazon Web Services S3 WAF** has to be used to ingest
+    - **AWS WAF Logs**
+- The Content Hub Microsoft Sentinel solution **Amazon Web Services Network Firewall** has to be used to ingest
+    - **Network Firewall Flow Logs**
+    - **Network Firewal Alert Logs**
+    - **Network Firewal TLS logs**
+- The Content Hub Microsoft Sentinel solution **Amazon Web Services S3 DNS Route53** has to be used to ingest
+    - **AWS Route53 Resolver Logs**
+
+For **Security Hub Findings** deploy the following [CloudFormation template](SecurityHub/template.yaml) in the SecurityHub Administrator account and use the Content Hub Microsoft Sentinel solution **AWS Security Hub Findings**.
+The architetcure diagram to ingest SecurityHub findings in Microsoft Sentinel is below.
+![Architecture](SecurityHub/docs/Architecture.png)
+
 
 ### Target audience
 

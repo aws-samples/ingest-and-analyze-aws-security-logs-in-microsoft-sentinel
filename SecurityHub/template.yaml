@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Creates AWS Security Hub Microsoft Sentinel Integration.
+Parameters:
+    AzureWorkspaceID:
+      Description: Azure Workspace Identifier.
+      Type: String
+    EmailAddress:
+      Description: Email address to send failure notifications in processing the logs.
+      Type: String
+    Suffix:
+      Description: Resource suffix to avoid name conflicts.
+      Default: securityhub
+      Type: String
+    OIDCProviderArn:
+      Description: Arn for the Sentinel OIDC Provider.
+      Default: ""
+      Type: String
+Conditions:
+  CreateOIDCProvider: !Equals
+    - !Ref OIDCProviderArn
+    - ""
+
+Resources:
+  SentinelSQS:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: True
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+
+  SentinelSQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: SQS-S3-Notifications
+            Action:
+              - sqs:SendMessage
+              - sqs:GetQueueAttributes
+              - sqs:GetQueueUrl
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:s3:::securityhub-raw-sentinel-${AWS::AccountId}-${AWS::Region}"
+            Resource: !GetAtt SentinelSQS.Arn
+          - Sid: SQS-Sentinel-Receive
+            Action:
+              - sqs:ChangeMessageVisibility
+              - sqs:DeleteMessage
+              - sqs:ReceiveMessage
+              - sqs:GetQueueUrl
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt SentinelRole.Arn
+            Resource: !GetAtt SentinelSQS.Arn
+      Queues:
+        - !Ref SentinelSQS
+
+  SecurityHubLogRawBucket:
+      Type: 'AWS::S3::Bucket'
+      Properties:
+        BucketName: !Sub 'securityhub-raw-sentinel-${AWS::AccountId}-${AWS::Region}'
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: 'AES256'
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+  SentinelOIDC:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOIDCProvider
+    Properties:
+      Url: https://sts.windows.net/33e01921-4d64-4f8c-a055-5bdaffd5e33d/
+      ClientIdList:
+        - api://1462b192-27f7-4cb9-8523-0f4ecb54b47e
+      ThumbprintList:
+        - 626d44e704d1ceabe3bf0d53397464ac8080142c
+
+  SentinelRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub OIDC_aws-sentinel-oidc-role-${Suffix}
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRoleWithWebIdentity
+            Principal:
+              Federated: !If
+                - CreateOIDCProvider
+                - !Ref SentinelOIDC
+                - !Ref OIDCProviderArn
+            Condition:
+              StringLike:
+                sts:RoleSessionName: !Sub "MicrosoftSentinel_${AzureWorkspaceID}"
+      Description: "Sentinel role"
+      Policies:
+      - PolicyName: 'Sentinel-policy'
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 's3:GetObject'
+            - 's3:ListBucket'
+            Resource:
+              - !GetAtt SecurityHubLogRawBucket.Arn
+              - !Sub '${SecurityHubLogRawBucket.Arn}/*'
+          - Effect: Allow
+            Action:
+              - 'sqs:ReceiveMessage'
+              - 'sqs:DeleteMessage'
+              - 'sqs:ChangeMessageVisibility'
+              - 'sqs:GetQueueAttributes'
+              - 'sqs:GetQueueUrl'
+            Resource: !GetAtt SentinelSQS.Arn
+
+  SentinelSNSAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: alias/aws/sns
+      DisplayName: !Sub alert-topic-sentinel-${Suffix}
+      TopicName: !Sub alert-topic-sentinel-${Suffix}
+
+  SentinelAlertTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Sub "${EmailAddress}"
+      Protocol: email
+      TopicArn: !Ref SentinelSNSAlertTopic
+
+  SentinelOldMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub sentinel-old-messages-queue-alarm-${Suffix}
+      Namespace: AWS/SQS
+      MetricName: ApproximateAgeOfOldestMessage
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SentinelSQS.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 300
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SentinelSNSAlertTopic
+
+  SecurityHubEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: 'Forward AWS Security Hub findings to Kinesis Firehose'
+      State: 'ENABLED'
+      EventPattern: 
+        source: 
+          - 'aws.securityhub'
+        detail-type:
+          - 'Security Hub Findings - Imported'
+      Targets:
+        - Arn: !GetAtt SecurityHubFirehose.Arn
+          Id: FirehoseStream
+          RoleArn: !GetAtt SecurityHubLogDeliveryRole.Arn
+
+  SecurityHubLogDeliveryRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: 'AllowSecurityHubLogDelivery'
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: securityhub_log_delivery_policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'firehose:PutRecord'
+                  - 'firehose:PutRecordBatch'
+                Resource:
+                  - !GetAtt SecurityHubFirehose.Arn
+
+  FirehoseDeliveryRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: 'AllowFirehoseDelivery'
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref 'AWS::AccountId'
+
+  SecurityHubFirehose:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt SecurityHubLogRawBucket.Arn
+        BufferingHints:
+          IntervalInSeconds: '300'
+          SizeInMBs: '128'
+        CompressionFormat: GZIP
+        FileExtension: .gz
+        Prefix: !Sub AWSLogs/${AWS::AccountId}/SecurityHubFindings/
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: AppendDelimiterToRecord
+              Parameters:
+                - ParameterName: Delimiter
+                  ParameterValue: "\\n"
+
+  SecurityHubFirehoseDeliveryPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyName: firehose_delivery_policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+            Resource: 
+              - !GetAtt SecurityHubLogRawBucket.Arn
+              - !Sub '${SecurityHubLogRawBucket.Arn}/*'
+      Roles:
+        - !Ref FirehoseDeliveryRole
+
+Outputs:
+  SQSUrl:
+    Description: 'URL of the SQS Queue'
+    Value: !Ref SentinelSQS
+
+  Role:
+    Description: 'IAM Role ARN'
+    Value: !GetAtt SentinelRole.Arn
